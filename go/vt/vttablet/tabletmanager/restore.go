@@ -73,11 +73,45 @@ func (tm *TabletManager) RestoreData(ctx context.Context, logger logutil.Logger,
 	if err := tm.lock(ctx); err != nil {
 		return err
 	}
+	if tm.orc != nil {
+		var orcErr error
+		backoffTime := time.Second * 5
+		maxAttempts := 10
+		for i := 0; i < maxAttempts; i++ {
+			orcErr = tm.orc.BeginMaintenance(tm.Tablet(), "vttablet is under the process of restore")
+			if orcErr == nil {
+				log.Infof("Orchestrator BeginMaintenance Succeed.")
+				break
+			}
+			log.Warningf("Orchestrator BeginMaintenance failed, Waiting %v to check again: %v", backoffTime, orcErr)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoffTime):
+			}
+		}
+		if orcErr != nil {
+			return orcErr
+		}
+	}
 	defer tm.unlock()
 	if tm.Cnf == nil {
 		return fmt.Errorf("cannot perform restore without my.cnf, please restart vttablet with a my.cnf file specified")
 	}
-	return tm.restoreDataLocked(ctx, logger, waitForBackupInterval, deleteBeforeRestore)
+	err := tm.restoreDataLocked(ctx, logger, waitForBackupInterval, deleteBeforeRestore)
+	if err == nil {
+		// End orchestrator maintenance at the end of restore
+		// This is a best effort operation, so it should happen in a goroutine
+		go func() {
+			if tm.orc == nil {
+				return
+			}
+			if err := tm.orc.EndMaintenance(tm.Tablet()); err != nil {
+				log.Warningf("Orchestrator EndMaintenance failed: %v", err)
+			}
+		}()
+	}
+	return err
 }
 
 func (tm *TabletManager) restoreDataLocked(ctx context.Context, logger logutil.Logger, waitForBackupInterval time.Duration, deleteBeforeRestore bool) error {
@@ -469,7 +503,7 @@ func (tm *TabletManager) startReplication(ctx context.Context, pos mysql.Positio
 	}
 
 	// Set master and start replication.
-	if err := tm.MysqlDaemon.SetMaster(ctx, ti.Tablet.MysqlHostname, int(ti.Tablet.MysqlPort), false /* stopReplicationBefore */, true /* startReplicationAfter */); err != nil {
+	if err := tm.MysqlDaemon.SetMaster(ctx, ti.Tablet.MysqlHostname, int(ti.Tablet.MysqlPort), false /* stopReplicationBefore */, !*mysqlctl.DisableActiveReparents /* startReplicationAfter */); err != nil {
 		return vterrors.Wrap(err, "MysqlDaemon.SetMaster failed")
 	}
 
